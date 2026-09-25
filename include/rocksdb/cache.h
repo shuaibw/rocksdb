@@ -295,6 +295,28 @@ inline std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts) {
   return cache_opts.MakeSharedCache();
 }
 
+// EXPERIMENTAL (block-cache research). Three independent LRU caches with fixed
+// byte budgets: index blocks, filter blocks, and everything else (data blocks).
+// Requests are routed by CacheEntryRole; a partition evicts only within its own
+// budget, so no block type can take space from another. Each partition is a
+// stock LRUCache with the given shard bits and (optional) high-priority pool
+// ratio; the total capacity is the sum of the three and cannot be changed
+// after construction.
+struct PartitionedLRUCacheOptions {
+  size_t index_capacity = 0;
+  size_t filter_capacity = 0;
+  size_t data_capacity = 0;
+  int num_shard_bits = 0;
+  double high_pri_pool_ratio = 0.0;
+  bool use_adaptive_mutex = kDefaultToAdaptiveMutex;
+  CacheMetadataChargePolicy metadata_charge_policy =
+      kDefaultCacheMetadataChargePolicy;
+};
+
+// Returns nullptr if any capacity is zero or the pool ratio is out of range.
+std::shared_ptr<Cache> NewPartitionedLRUCache(
+    const PartitionedLRUCacheOptions& opts);
+
 // EXPERIMENTAL
 // Options structure for configuring a SecondaryCache instance with in-memory
 // compression. The implementation uses LRUCache so inherits its options,
