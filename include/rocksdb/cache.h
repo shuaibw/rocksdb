@@ -317,6 +317,11 @@ struct PartitionedLRUCacheOptions {
 std::shared_ptr<Cache> NewPartitionedLRUCache(
     const PartitionedLRUCacheOptions& opts);
 
+// EXPERIMENTAL research instrumentation: appends placement/eviction/lookup
+// counters and a census of the LRU list to *out for an LRUCache, or for each
+// partition of a PartitionedLRUCache. Returns false for other cache types.
+bool GetLRUCacheResearchStats(Cache* cache, std::string* out);
+
 // EXPERIMENTAL
 // Options structure for configuring a SecondaryCache instance with in-memory
 // compression. The implementation uses LRUCache so inherits its options,

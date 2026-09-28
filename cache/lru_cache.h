@@ -347,6 +347,11 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   // Retrieves low pri pool ratio
   double GetLowPriPoolRatio();
 
+  // EXPERIMENTAL research instrumentation: cumulative counters of list
+  // placements, evictions and lookups by block role, and a census of the
+  // current LRU list by region (high-pri pool / low-pri pool / bottom).
+  void AppendResearchStats(std::string& str);
+
   void AppendPrintableOptions(std::string& /*str*/) const;
 
  private:
@@ -400,6 +405,24 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   // Low-pri pool size, equals to capacity * low_pri_pool_ratio.
   // Remember the value to avoid recomputing each time.
   double low_pri_pool_capacity_;
+
+  // EXPERIMENTAL research counters (AppendResearchStats). Role buckets:
+  // 0 index, 1 filter, 2 data, 3 other. Updated under mutex_ only.
+  struct ResearchCounters {
+    uint64_t insert_pool_meta[4] = {};      // IsHighPri() entries placed in the high-pri pool
+    uint64_t insert_pool_promoted[4] = {};  // placed in the high-pri pool because HasHit()
+    uint64_t insert_low[4] = {};
+    uint64_t insert_bottom[4] = {};
+    uint64_t evict_pool[4] = {};
+    uint64_t evict_low[4] = {};
+    uint64_t evict_bottom[4] = {};
+    uint64_t lookup_hit_pool[4] = {};
+    uint64_t lookup_hit_unprotected[4] = {};  // found in low/bottom region, unreferenced
+    uint64_t lookup_hit_referenced[4] = {};   // found while another reader holds it
+    uint64_t demote_pool = 0;
+    uint64_t demote_low = 0;
+  } rc_;
+  static int RoleBucket(const LRUHandle* e);
 
   // Dummy head of LRU list.
   // lru.prev is newest entry, lru.next is oldest entry.
@@ -462,6 +485,8 @@ class LRUCache
   size_t TEST_GetLRUSize();
   // Retrieves high pri pool ratio.
   double GetHighPriPoolRatio();
+  // EXPERIMENTAL research instrumentation (all shards).
+  void AppendResearchStats(std::string& str);
 };
 
 }  // namespace lru_cache

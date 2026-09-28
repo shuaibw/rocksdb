@@ -166,6 +166,35 @@ TEST_F(PartitionedLRUCacheTest, ApplyToAllEntriesCoversAllPartitions) {
   ASSERT_EQ(0u, cache_->GetUsage());
 }
 
+TEST_F(PartitionedLRUCacheTest, ResearchStatsCountPlacements) {
+  // Plain LRUCache with a half-size pool: metadata goes to the pool directly,
+  // a data entry only after its second lookup.
+  LRUCacheOptions lo(1000, 0, false, 0.5, nullptr, kDefaultToAdaptiveMutex,
+                     kDontChargeCacheMetadata, 0.0);
+  std::shared_ptr<Cache> lru = lo.MakeSharedCache();
+  ASSERT_OK(lru->Insert("i1", nullptr, &kIndexHelper, 100, nullptr, Cache::Priority::HIGH));
+  ASSERT_OK(lru->Insert("d1", nullptr, &kDataHelper, 100));
+  ASSERT_OK(lru->Insert("d2", nullptr, &kDataHelper, 100));
+  Cache::Handle* h = lru->Lookup("d1", &kDataHelper, nullptr);
+  ASSERT_TRUE(h != nullptr);
+  lru->Release(h);  // re-inserted into the pool: HasHit()
+  std::string st;
+  ASSERT_TRUE(GetLRUCacheResearchStats(lru.get(), &st));
+  ASSERT_NE(std::string::npos, st.find("insert_pool_meta         index=1 filter=0 data=0 other=0"));
+  ASSERT_NE(std::string::npos, st.find("insert_pool_promoted     index=0 filter=0 data=1 other=0"));
+  ASSERT_NE(std::string::npos, st.find("insert_bottom            index=0 filter=0 data=2 other=0"));
+  ASSERT_NE(std::string::npos, st.find("lookup_hit_unprotected   index=0 filter=0 data=1 other=0"));
+  ASSERT_NE(std::string::npos, st.find("census pool   index n=1 bytes=100 filter n=0 bytes=0 data n=1 bytes=100"));
+  ASSERT_NE(std::string::npos, st.find("census bottom index n=0 bytes=0 filter n=0 bytes=0 data n=1 bytes=100"));
+  // Partitioned cache: one census per partition.
+  NewCache(1000, 1000, 1000);
+  Insert("f1", &kFilterHelper, 100);
+  st.clear();
+  ASSERT_TRUE(GetLRUCacheResearchStats(cache_.get(), &st));
+  ASSERT_NE(std::string::npos, st.find("[partition filter]"));
+  ASSERT_NE(std::string::npos, st.find("[partition data]"));
+}
+
 TEST_F(PartitionedLRUCacheTest, PrintableOptionsListBudgets) {
   NewCache(1000, 2000, 3000);
   std::string s = cache_->GetPrintableOptions();

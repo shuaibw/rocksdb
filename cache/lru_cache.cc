@@ -265,6 +265,11 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
     e->SetInHighPriPool(true);
     e->SetInLowPriPool(false);
     high_pri_pool_usage_ += e->total_charge;
+    if (e->IsHighPri()) {
+      rc_.insert_pool_meta[RoleBucket(e)]++;
+    } else {
+      rc_.insert_pool_promoted[RoleBucket(e)]++;
+    }
     MaintainPoolSize();
   } else if (low_pri_pool_ratio_ > 0 &&
              (e->IsHighPri() || e->IsLowPri() || e->HasHit())) {
@@ -277,6 +282,7 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
     e->SetInLowPriPool(true);
     low_pri_pool_usage_ += e->total_charge;
     lru_low_pri_ = e;
+    rc_.insert_low[RoleBucket(e)]++;
     MaintainPoolSize();
   } else {
     // Insert "e" to the head of bottom-pri pool.
@@ -291,8 +297,83 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
       lru_low_pri_ = e;
     }
     lru_bottom_pri_ = e;
+    rc_.insert_bottom[RoleBucket(e)]++;
   }
   lru_usage_ += e->total_charge;
+}
+
+int LRUCacheShard::RoleBucket(const LRUHandle* e) {
+  if (e->helper == nullptr) {
+    return 3;
+  }
+  switch (e->helper->role) {
+    case CacheEntryRole::kIndexBlock:
+      return 0;
+    case CacheEntryRole::kFilterBlock:
+    case CacheEntryRole::kFilterMetaBlock:
+      return 1;
+    case CacheEntryRole::kDataBlock:
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+void LRUCacheShard::AppendResearchStats(std::string& str) {
+  static const char* kRole[4] = {"index", "filter", "data", "other"};
+  uint64_t n[3][4] = {}, bytes[3][4] = {};
+  size_t usage, lru_usage, pool_usage, low_usage;
+  ResearchCounters c;
+  {
+    DMutexLock l(mutex_);
+    for (LRUHandle* e = lru_.next; e != &lru_; e = e->next) {
+      const int r = e->InHighPriPool() ? 0 : (e->InLowPriPool() ? 1 : 2);
+      const int b = RoleBucket(e);
+      n[r][b]++;
+      bytes[r][b] += e->total_charge;
+    }
+    usage = usage_;
+    lru_usage = lru_usage_;
+    pool_usage = high_pri_pool_usage_;
+    low_usage = low_pri_pool_usage_;
+    c = rc_;
+  }
+  char buf[512];
+  snprintf(buf, sizeof(buf),
+           "  usage=%zu in_list=%zu pinned=%zu pool=%zu low=%zu bottom=%zu\n",
+           usage, lru_usage, usage - lru_usage, pool_usage, low_usage,
+           lru_usage - pool_usage - low_usage);
+  str.append(buf);
+  static const char* kRegion[3] = {"pool", "low", "bottom"};
+  for (int r = 0; r < 3; r++) {
+    snprintf(buf, sizeof(buf), "  census %-6s", kRegion[r]);
+    str.append(buf);
+    for (int b = 0; b < 4; b++) {
+      snprintf(buf, sizeof(buf), " %s n=%llu bytes=%llu", kRole[b],
+               (unsigned long long)n[r][b], (unsigned long long)bytes[r][b]);
+      str.append(buf);
+    }
+    str.append("\n");
+  }
+  auto row = [&](const char* name, const uint64_t v[4]) {
+    snprintf(buf, sizeof(buf), "  %-24s index=%llu filter=%llu data=%llu other=%llu\n",
+             name, (unsigned long long)v[0], (unsigned long long)v[1],
+             (unsigned long long)v[2], (unsigned long long)v[3]);
+    str.append(buf);
+  };
+  row("insert_pool_meta", c.insert_pool_meta);
+  row("insert_pool_promoted", c.insert_pool_promoted);
+  row("insert_low", c.insert_low);
+  row("insert_bottom", c.insert_bottom);
+  row("evict_pool", c.evict_pool);
+  row("evict_low", c.evict_low);
+  row("evict_bottom", c.evict_bottom);
+  row("lookup_hit_pool", c.lookup_hit_pool);
+  row("lookup_hit_unprotected", c.lookup_hit_unprotected);
+  row("lookup_hit_referenced", c.lookup_hit_referenced);
+  snprintf(buf, sizeof(buf), "  demote_pool=%llu demote_low=%llu\n",
+           (unsigned long long)c.demote_pool, (unsigned long long)c.demote_low);
+  str.append(buf);
 }
 
 void LRUCacheShard::MaintainPoolSize() {
@@ -306,6 +387,7 @@ void LRUCacheShard::MaintainPoolSize() {
     assert(high_pri_pool_usage_ >= lru_low_pri_->total_charge);
     high_pri_pool_usage_ -= lru_low_pri_->total_charge;
     low_pri_pool_usage_ += lru_low_pri_->total_charge;
+    rc_.demote_pool++;
   }
 
   while (low_pri_pool_usage_ > low_pri_pool_capacity_) {
@@ -317,6 +399,7 @@ void LRUCacheShard::MaintainPoolSize() {
     lru_bottom_pri_->SetInLowPriPool(false);
     assert(low_pri_pool_usage_ >= lru_bottom_pri_->total_charge);
     low_pri_pool_usage_ -= lru_bottom_pri_->total_charge;
+    rc_.demote_low++;
   }
 }
 
@@ -326,6 +409,16 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
     LRUHandle* old = lru_.next;
     // LRU list contains only elements which can be evicted.
     assert(old->InCache() && !old->HasRefs());
+    {
+      const int b = RoleBucket(old);
+      if (old->InHighPriPool()) {
+        rc_.evict_pool[b]++;
+      } else if (old->InLowPriPool()) {
+        rc_.evict_low[b]++;
+      } else {
+        rc_.evict_bottom[b]++;
+      }
+    }
     LRU_Remove(old);
     table_.Remove(old->key(), old->hash);
     old->SetInCache(false);
@@ -436,6 +529,16 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
   LRUHandle* e = table_.Lookup(key, hash);
   if (e != nullptr) {
     assert(e->InCache());
+    {
+      const int b = RoleBucket(e);
+      if (e->HasRefs()) {
+        rc_.lookup_hit_referenced[b]++;
+      } else if (e->InHighPriPool()) {
+        rc_.lookup_hit_pool[b]++;
+      } else {
+        rc_.lookup_hit_unprotected[b]++;
+      }
+    }
     if (!e->HasRefs()) {
       // The entry is in LRU since it's in hash and has no external
       // references.
@@ -693,6 +796,12 @@ size_t LRUCache::TEST_GetLRUSize() {
 
 double LRUCache::GetHighPriPoolRatio() {
   return GetShard(0).GetHighPriPoolRatio();
+}
+
+void LRUCache::AppendResearchStats(std::string& str) {
+  for (uint32_t i = 0; i < GetNumShards(); i++) {
+    GetShard(i).AppendResearchStats(str);
+  }
 }
 
 }  // namespace lru_cache

@@ -7,6 +7,9 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstring>
+
+#include "cache/lru_cache.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -212,6 +215,29 @@ std::shared_ptr<Cache> NewPartitionedLRUCache(
   return std::make_shared<PartitionedLRUCache>(opts, std::move(index),
                                                std::move(filter),
                                                std::move(data));
+}
+
+bool GetLRUCacheResearchStats(Cache* cache, std::string* out) {
+  if (cache == nullptr || out == nullptr) {
+    return false;
+  }
+  if (strcmp(cache->Name(), "PartitionedLRUCache") == 0) {
+    auto* p = static_cast<PartitionedLRUCache*>(cache);
+    bool ok = true;
+    const std::pair<const char*, Cache*> parts[3] = {
+        {"index", p->index_cache()}, {"filter", p->filter_cache()},
+        {"data", p->data_cache()}};
+    for (const auto& part : parts) {
+      out->append(std::string("[partition ") + part.first + "]\n");
+      ok = GetLRUCacheResearchStats(part.second, out) && ok;
+    }
+    return ok;
+  }
+  if (strcmp(cache->Name(), "LRUCache") == 0) {
+    static_cast<LRUCache*>(cache)->AppendResearchStats(*out);
+    return true;
+  }
+  return false;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
