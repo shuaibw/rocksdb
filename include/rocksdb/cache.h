@@ -311,6 +311,20 @@ struct PartitionedLRUCacheOptions {
   bool use_adaptive_mutex = kDefaultToAdaptiveMutex;
   CacheMetadataChargePolicy metadata_charge_policy =
       kDefaultCacheMetadataChargePolicy;
+
+  // Adaptive budgets (research): the three budgets above become the starting
+  // point of a controller. A ghost list behind each partition remembers the
+  // identities of the blocks it evicted (real + ghost <= total); a lookup that
+  // misses the partition but hits its ghost list moves the budget boundary
+  // toward that partition by ghost_step * 4096 * (4096 / charge) bytes, taken
+  // from the other two in proportion to what they hold above the floor
+  // ghost_min_frac * total. Every ghost_apply_every lookups the capacities
+  // move toward the targets by at most ghost_max_move bytes per partition.
+  bool adaptive = false;
+  double ghost_step = 1.0;
+  size_t ghost_apply_every = 1024;
+  double ghost_min_frac = 1.0 / 16;
+  size_t ghost_max_move = 256 * 1024;
 };
 
 // Returns nullptr if any capacity is zero or the pool ratio is out of range.
@@ -321,6 +335,11 @@ std::shared_ptr<Cache> NewPartitionedLRUCache(
 // counters and a census of the LRU list to *out for an LRUCache, or for each
 // partition of a PartitionedLRUCache. Returns false for other cache types.
 bool GetLRUCacheResearchStats(Cache* cache, std::string* out);
+
+// EXPERIMENTAL research instrumentation: one line with the current budgets of
+// a PartitionedLRUCache (targets, applied capacities, ghost-list sizes and
+// ghost hits per partition). Returns false for other cache types.
+bool GetPartitionedLRUCacheBudgets(Cache* cache, std::string* out);
 
 // EXPERIMENTAL
 // Options structure for configuring a SecondaryCache instance with in-memory

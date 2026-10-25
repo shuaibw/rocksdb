@@ -5,6 +5,7 @@
 
 #include "cache/partitioned_lru_cache.h"
 
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -203,6 +204,208 @@ TEST_F(PartitionedLRUCacheTest, PrintableOptionsListBudgets) {
   ASSERT_NE(std::string::npos, s.find("data_capacity : 3000"));
   cache_->SetCapacity(50);  // deliberate no-op
   ASSERT_EQ(6000u, cache_->GetCapacity());
+}
+
+// ---- adaptive mode (ghost-cache controller) ----
+
+namespace {
+PartitionedLRUCacheOptions AdaptiveOpts(size_t index, size_t filter, size_t data,
+                                        size_t max_move = size_t{1} << 30,
+                                        double min_frac = 0.1) {
+  PartitionedLRUCacheOptions o = Opts(index, filter, data);
+  o.adaptive = true;
+  o.ghost_step = 1.0;
+  o.ghost_apply_every = 1;  // apply after every lookup
+  o.ghost_min_frac = min_frac;
+  o.ghost_max_move = max_move;
+  return o;
+}
+std::string Key(const char* prefix, int i) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%s%06d", prefix, i);
+  return std::string(buf);
+}
+}  // namespace
+
+TEST_F(PartitionedLRUCacheTest, AdaptiveRejectsBadOptions) {
+  PartitionedLRUCacheOptions o = AdaptiveOpts(1000, 1000, 2000);
+  o.ghost_step = 0.0;
+  ASSERT_TRUE(NewPartitionedLRUCache(o) == nullptr);
+  o = AdaptiveOpts(1000, 1000, 2000);
+  o.ghost_min_frac = 0.3;  // floor 1200 > index budget 1000
+  ASSERT_TRUE(NewPartitionedLRUCache(o) == nullptr);
+  o = AdaptiveOpts(1000, 1000, 2000);
+  o.ghost_max_move = 0;
+  ASSERT_TRUE(NewPartitionedLRUCache(o) == nullptr);
+}
+
+TEST_F(PartitionedLRUCacheTest, FixedModeHasNoController) {
+  NewCache(1000, 1000, 2000);
+  for (int i = 0; i < 50; i++) {
+    Insert(Key("d", i), &kDataHelper, 100);
+  }
+  ASSERT_FALSE(Found(Key("d", 0), &kDataHelper));  // evicted
+  PartitionedLRUCache::AdaptiveStats st = pc_->GetAdaptiveStats();
+  ASSERT_FALSE(st.enabled);
+  ASSERT_EQ(st.ghost_entries[PartitionedLRUCache::kData], 0u);
+  ASSERT_EQ(st.ghost_hits[PartitionedLRUCache::kData], 0u);
+  ASSERT_EQ(pc_->data_cache()->GetCapacity(), 2000u);
+}
+
+TEST_F(PartitionedLRUCacheTest, AdaptiveStartsAtGivenBudgets) {
+  cache_ = NewPartitionedLRUCache(AdaptiveOpts(1000, 1000, 2000));
+  ASSERT_TRUE(cache_ != nullptr);
+  pc_ = static_cast<PartitionedLRUCache*>(cache_.get());
+  PartitionedLRUCache::AdaptiveStats st = pc_->GetAdaptiveStats();
+  ASSERT_TRUE(st.enabled);
+  ASSERT_EQ(st.total, 4000u);
+  ASSERT_EQ(st.actual[0], 1000u);
+  ASSERT_EQ(st.actual[1], 1000u);
+  ASSERT_EQ(st.actual[2], 2000u);
+  ASSERT_EQ(st.target[2], 2000u);
+  ASSERT_EQ(cache_->GetCapacity(), 4000u);
+  ASSERT_NE(pc_->GetPrintableOptions().find("adaptive : 1"), std::string::npos);
+}
+
+TEST_F(PartitionedLRUCacheTest, EvictionsEnterGhostWithinBound) {
+  cache_ = NewPartitionedLRUCache(AdaptiveOpts(1000, 1000, 2000));
+  pc_ = static_cast<PartitionedLRUCache*>(cache_.get());
+  // 40 data blocks of 100 B: 20 fit, 20 are evicted into the ghost list.
+  for (int i = 0; i < 40; i++) {
+    Insert(Key("d", i), &kDataHelper, 100);
+  }
+  PartitionedLRUCache::AdaptiveStats st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.ghost_entries[PartitionedLRUCache::kData], 20u);
+  ASSERT_EQ(st.ghost_bytes[PartitionedLRUCache::kData], 2000u);
+  ASSERT_EQ(st.ghost_inserts[PartitionedLRUCache::kData], 20u);
+  // real + ghost <= total: 2000 + 2000 = 4000; more evictions trim the ghost.
+  for (int i = 40; i < 80; i++) {
+    Insert(Key("d", i), &kDataHelper, 100);
+  }
+  st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.ghost_entries[PartitionedLRUCache::kData], 20u);
+  ASSERT_LE(st.ghost_bytes[PartitionedLRUCache::kData],
+            st.total - st.actual[PartitionedLRUCache::kData]);
+  ASSERT_EQ(st.ghost_inserts[PartitionedLRUCache::kData], 60u);
+  // Metadata partitions saw nothing.
+  ASSERT_EQ(st.ghost_entries[PartitionedLRUCache::kIndex], 0u);
+  ASSERT_EQ(st.ghost_entries[PartitionedLRUCache::kFilter], 0u);
+}
+
+TEST_F(PartitionedLRUCacheTest, GhostHitMovesBudgetToData) {
+  cache_ = NewPartitionedLRUCache(AdaptiveOpts(1000, 1000, 2000));
+  pc_ = static_cast<PartitionedLRUCache*>(cache_.get());
+  for (int i = 0; i < 30; i++) {
+    Insert(Key("d", i), &kDataHelper, 100);  // d0..d9 evicted
+  }
+  ASSERT_FALSE(Found(Key("d", 0), &kDataHelper));  // miss + ghost hit
+  PartitionedLRUCache::AdaptiveStats st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.ghost_hits[PartitionedLRUCache::kData], 1u);
+  // 9 ghost entries remain after the hit, then the grown partition's ghost
+  // bound (total - actual = 800 B) trims them to 8.
+  ASSERT_EQ(st.ghost_entries[PartitionedLRUCache::kData], 8u);
+  ASSERT_EQ(st.ghost_bytes[PartitionedLRUCache::kData], 800u);
+  // step = 4096 * 4096 / 100 bytes, clamped to the donors' room above the
+  // floor (10% of 4000 = 400): (1000 - 400) * 2 = 1200 -> data 3200.
+  ASSERT_EQ(st.target[PartitionedLRUCache::kData], 3200u);
+  ASSERT_EQ(st.target[PartitionedLRUCache::kIndex], 400u);
+  ASSERT_EQ(st.target[PartitionedLRUCache::kFilter], 400u);
+  // apply_every = 1 and no move cap: applied at once.
+  ASSERT_EQ(st.actual[PartitionedLRUCache::kData], 3200u);
+  ASSERT_EQ(st.actual[PartitionedLRUCache::kIndex], 400u);
+  ASSERT_EQ(st.applies, 1u);
+  ASSERT_EQ(cache_->GetCapacity(), 4000u);
+  ASSERT_EQ(pc_->data_cache()->GetCapacity(), 3200u);
+  ASSERT_EQ(pc_->index_cache()->GetCapacity(), 400u);
+  // The shrunken index partition really holds only 400 B now: the fifth
+  // 100 B block evicts the first, whose identity lands in the index ghost.
+  for (int i = 0; i < 5; i++) {
+    Insert(Key("i", i), &kIndexHelper, 100);
+  }
+  st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.ghost_entries[PartitionedLRUCache::kIndex], 1u);
+  ASSERT_EQ(st.ghost_bytes[PartitionedLRUCache::kIndex], 100u);
+  ASSERT_TRUE(Found(Key("i", 4), &kIndexHelper));
+  // Looking up a block that was never cached is not a ghost hit.
+  ASSERT_FALSE(Found(Key("d", 999), &kDataHelper));
+  st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.ghost_hits[PartitionedLRUCache::kData], 1u);
+  ASSERT_EQ(st.ghost_hits[PartitionedLRUCache::kIndex], 0u);
+}
+
+TEST_F(PartitionedLRUCacheTest, GhostHitWeighsByCharge) {
+  // Large partitions so nothing clamps: a 4 KB data ghost hit moves the
+  // boundary by 4096 B, a 1 KB filter ghost hit by 4096 * 4 = 16384 B.
+  cache_ = NewPartitionedLRUCache(
+      AdaptiveOpts(100000, 100000, 100000, size_t{1} << 30, 0.01));
+  pc_ = static_cast<PartitionedLRUCache*>(cache_.get());
+  for (int i = 0; i < 30; i++) {
+    Insert(Key("d", i), &kDataHelper, 4096);  // 24 fit, d0..d5 evicted
+  }
+  ASSERT_FALSE(Found(Key("d", 0), &kDataHelper));
+  PartitionedLRUCache::AdaptiveStats st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.target[PartitionedLRUCache::kData], 104096u);
+  ASSERT_EQ(st.target[PartitionedLRUCache::kIndex], 97952u);  // half each
+  ASSERT_EQ(st.target[PartitionedLRUCache::kFilter], 97952u);
+  size_t filter_before = st.target[PartitionedLRUCache::kFilter];
+  for (int i = 0; i < 120; i++) {
+    Insert(Key("f", i), &kFilterHelper, 1024);  // ~95 fit
+  }
+  ASSERT_FALSE(Found(Key("f", 0), &kFilterHelper));
+  st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.ghost_hits[PartitionedLRUCache::kFilter], 1u);
+  ASSERT_EQ(st.target[PartitionedLRUCache::kFilter], filter_before + 16384u);
+  ASSERT_EQ(st.target[0] + st.target[1] + st.target[2], 300000u);
+  ASSERT_EQ(st.actual[0] + st.actual[1] + st.actual[2], 300000u);
+  ASSERT_EQ(cache_->GetCapacity(), 300000u);
+}
+
+TEST_F(PartitionedLRUCacheTest, ApplyIsRateLimited) {
+  cache_ = NewPartitionedLRUCache(
+      AdaptiveOpts(1000, 1000, 2000, /*max_move=*/100));
+  pc_ = static_cast<PartitionedLRUCache*>(cache_.get());
+  for (int i = 0; i < 30; i++) {
+    Insert(Key("d", i), &kDataHelper, 100);
+  }
+  ASSERT_FALSE(Found(Key("d", 0), &kDataHelper));  // ghost hit, target 3200
+  PartitionedLRUCache::AdaptiveStats st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.target[PartitionedLRUCache::kData], 3200u);
+  // Growth capped at 100 per application; donors shrink 50 each so the sum
+  // stays 4000 (shrink is scaled down to match the capped growth).
+  ASSERT_EQ(st.actual[PartitionedLRUCache::kData], 2100u);
+  ASSERT_EQ(st.actual[0] + st.actual[1] + st.actual[2], 4000u);
+  ASSERT_EQ(cache_->GetCapacity(), 4000u);
+  ASSERT_FALSE(Found(Key("d", 998), &kDataHelper));  // another apply
+  st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.actual[PartitionedLRUCache::kData], 2200u);
+  ASSERT_EQ(st.applies, 2u);
+  ASSERT_EQ(cache_->GetCapacity(), 4000u);
+}
+
+TEST_F(PartitionedLRUCacheTest, ReinsertClearsGhostEntry) {
+  cache_ = NewPartitionedLRUCache(AdaptiveOpts(1000, 1000, 2000));
+  pc_ = static_cast<PartitionedLRUCache*>(cache_.get());
+  for (int i = 0; i < 30; i++) {
+    Insert(Key("d", i), &kDataHelper, 100);  // d0..d9 in the ghost
+  }
+  // d3 comes back without a lookup; its insertion evicts d10 into the ghost
+  // (10 - 1 + 1 entries), and d3's own ghost entry is cleared.
+  Insert(Key("d", 3), &kDataHelper, 100);
+  PartitionedLRUCache::AdaptiveStats st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.ghost_entries[PartitionedLRUCache::kData], 10u);
+  ASSERT_EQ(st.ghost_inserts[PartitionedLRUCache::kData], 11u);
+  ASSERT_TRUE(Found(Key("d", 3), &kDataHelper));
+  st = pc_->GetAdaptiveStats();
+  ASSERT_EQ(st.ghost_hits[PartitionedLRUCache::kData], 0u);
+}
+
+TEST_F(PartitionedLRUCacheTest, BudgetsLineIsAvailableThroughPublicApi) {
+  cache_ = NewPartitionedLRUCache(AdaptiveOpts(1000, 1000, 2000));
+  std::string line;
+  ASSERT_TRUE(GetPartitionedLRUCacheBudgets(cache_.get(), &line));
+  ASSERT_NE(line.find("budgets: adaptive=1 total=4000"), std::string::npos);
+  std::shared_ptr<Cache> plain = NewLRUCache(1000);
+  ASSERT_FALSE(GetPartitionedLRUCacheBudgets(plain.get(), &line));
 }
 
 }  // namespace ROCKSDB_NAMESPACE
