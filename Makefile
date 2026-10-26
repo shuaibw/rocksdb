@@ -2159,6 +2159,9 @@ lru_cache_test: $(OBJ_DIR)/cache/lru_cache_test.o $(TEST_LIBRARY) $(LIBRARY)
 partitioned_lru_cache_test: $(OBJ_DIR)/cache/partitioned_lru_cache_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+ghost_partitioned_lru_cache_test: $(OBJ_DIR)/cache/ghost_partitioned_lru_cache_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 tiered_secondary_cache_test: $(OBJ_DIR)/cache/tiered_secondary_cache_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
