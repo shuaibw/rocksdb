@@ -212,6 +212,37 @@ TEST_F(GhostPartitionedLRUCacheTest, ApplyIsRateLimited) {
   ASSERT_EQ(cache_->GetCapacity(), 4000u);
 }
 
+TEST_F(GhostPartitionedLRUCacheTest, ShrinkKeepsGhostHistory) {
+  // A shrink's evictions enter the ghost list while the list's bound must
+  // already be the post-shrink one (total - new capacity); otherwise every
+  // evicted byte would push out a byte of the oldest ghost history.
+  NewCache(Opts(1000, 1000, 2000));
+  for (int i = 0; i < 40; i++) {
+    Insert(Key("i", i), &kIndexHelper, 100);  // i30..i39 real, i0..i29 ghost
+  }
+  GhostPartitionedLRUCache::Stats st = gc_->GetStats();
+  ASSERT_EQ(st.ghost_bytes[GhostPartitionedLRUCache::kIndex], 3000u);
+  ASSERT_EQ(st.ghost_entries[GhostPartitionedLRUCache::kIndex], 30u);
+  for (int i = 0; i < 30; i++) {
+    Insert(Key("d", i), &kDataHelper, 100);  // d0..d9 evicted
+  }
+  // Data ghost hit -> index target 400 -> applied at once: the index shrinks
+  // from 1000 to 400 B, evicting i30..i35 (600 B) into its ghost list.
+  ASSERT_FALSE(Found(Key("d", 0), &kDataHelper));
+  st = gc_->GetStats();
+  ASSERT_EQ(st.actual[GhostPartitionedLRUCache::kIndex], 400u);
+  ASSERT_EQ(gc_->index_cache()->GetCapacity(), 400u);
+  // Bound is now 4000 - 400 = 3600: the 600 B of evictions join the 3000 B of
+  // history, nothing is discarded.
+  ASSERT_EQ(st.ghost_bytes[GhostPartitionedLRUCache::kIndex], 3600u);
+  ASSERT_EQ(st.ghost_entries[GhostPartitionedLRUCache::kIndex], 36u);
+  // The oldest remembered block is still a ghost hit.
+  ASSERT_FALSE(Found(Key("i", 0), &kIndexHelper));
+  st = gc_->GetStats();
+  ASSERT_EQ(st.ghost_hits[GhostPartitionedLRUCache::kIndex], 1u);
+  ASSERT_TRUE(Found(Key("i", 39), &kIndexHelper));
+}
+
 TEST_F(GhostPartitionedLRUCacheTest, ReinsertClearsGhostEntry) {
   NewCache(Opts(1000, 1000, 2000));
   for (int i = 0; i < 30; i++) {

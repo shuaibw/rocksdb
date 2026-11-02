@@ -240,11 +240,19 @@ bool GhostPartitionedLRUCache::PlanApply(size_t new_actual[3]) {
 void GhostPartitionedLRUCache::ApplyPlan(const size_t new_actual[3]) {
   // Shrink first so the total never exceeds total_. SetCapacity evicts
   // synchronously and fires the eviction callback, so mu_ must not be held.
+  // A shrinking partition's recorded budget is lowered BEFORE its capacity is
+  // reduced: the evictions of the shrink enter its ghost list through the
+  // callback, which trims against total_ - budget_actual_, and that bound must
+  // already be the post-shrink one or the shrink would discard as much ghost
+  // history as it evicts (the oldest entries, which should have been kept).
   size_t old[3];
   {
     std::lock_guard<std::mutex> l(mu_);
     for (int p = 0; p < 3; p++) {
       old[p] = budget_actual_[p];
+      if (new_actual[p] < old[p]) {
+        budget_actual_[p] = new_actual[p];
+      }
     }
   }
   for (int p = 0; p < 3; p++) {
